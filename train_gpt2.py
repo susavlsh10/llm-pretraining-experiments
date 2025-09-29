@@ -31,9 +31,11 @@ from torch.distributed import init_process_group, destroy_process_group
 import torch.distributed as dist
 import tiktoken
 
+from transformers import GPT2Config, GPT2LMHeadModel, GPT2Model
+
 # Import from our modules
-from gpt import GPT, GPTConfig, set_flash_attention
-from utils import (
+from models.gpt import GPT, GPTConfig, set_flash_attention
+from utils.gpt_utils import (
     print0, DistributedDataLoader, write_model, write_state, write_tokenizer,
     sample_generate, save_checkpoint
 )
@@ -194,6 +196,7 @@ if __name__ == "__main__":
     else:
         # load the GPT-2 model weights
         model = GPT.from_pretrained(args.model)
+    
     model.train()
     model.to(device)
     print(model)
@@ -386,3 +389,6 @@ if __name__ == "__main__":
     # clean up nice
     if ddp:
         destroy_process_group()
+    
+    # save the model to hf 
+    model.save_pretrained("gpt-pro")
