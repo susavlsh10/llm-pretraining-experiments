@@ -13,7 +13,12 @@ References:
 # 3) https://github.com/meta-llama/llama3/blob/11817d47e1ba7a4959b025eb1ca308572e0e3963/llama/generation.py
 
 Example launches to only benchmark the speed of bfloat16 compiled GPU training:
-TODO: add the actual commands
+
+Single GPU training 
+python train_llama3.py --input_bin /path/to/fineweb_train_*.bin --input_val_bin /path/to/fineweb_val.bin --output_dir ./out_llama3 --model meta-llama/Meta-Llama-3.1-8B --batch_size 4 --sequence_length 64 --total_batch_size 256 --num_iterations 1000 --learning_rate 1e-5 --warmup_iters 1000 --val_loss_every 100 --val_max_steps 20 --sample_every 200 --overfit_single_batch 0 --tensorcores 1 --dtype bfloat16 --device cuda:0 --compile 1 --zero_stage 0 --write_tensors 0 --checkpoint_every 500 --use_hf 0 --ckpt_dir /path/to/llama3_checkpoint/ --tokenizer_path /path/to/llama3_tokenizer/ --export_hf 1 --export_hf_dir ./hf_llama3_model/ --push_to_hub 0 --test_exported_model 1 --custom_n_layer 12 --custom_n_embd 1024
+
+torchrun --nproc_per_node=2 train_llama3.py --input_bin /path/to/fineweb_train_*.bin --input_val_bin /path/to/fineweb_val.bin --output_dir ./out_llama3 --model meta-llama/Meta-Llama-3.1-8B --batch_size 2 --sequence_length 64 --total_batch_size 256 --num_iterations 1000 --learning_rate 1e-5 --warmup_iters 1000 --val_loss_every 100 --val_max_steps 20 --sample_every 200 --overfit_single_batch 0 --tensorcores 1 --dtype bfloat16 --device cuda --compile 1 --zero_stage 0 --write_tensors 0 --checkpoint_every 500 --use_hf 0 --ckpt_dir /path/to/llama3_checkpoint/ --tokenizer_path /path/to/llama3_tokenizer/ --export_hf 1 --export_hf_dir ./hf_llama3_model/ --push_to_hub 0 --test_exported_model 1 --custom_n_layer 12 --custom_n_embd 1024
+
 """
 
 import argparse
@@ -21,7 +26,10 @@ import torch
 from models.llama import (print0, LLaMA, LlamaConfig,
                          DistributedShardedDataLoader, write_model, write_state,
                          export_to_huggingface,
-                         test_exported_model, save_checkpoint)
+                         test_exported_model, save_checkpoint, load_checkpoint)
+
+from models.llama import (detect_gpu_model, calculate_model_flops,
+                          get_gpu_peak_flops, calculate_mfu)
 
 from typing import List
 
@@ -274,6 +282,23 @@ def train(args, model, train_loader, val_loader=None, logfile=None):
         zero_stage=zero_stage
     )
 
+    # FLOPS calculation setup
+    gpu_model = detect_gpu_model()
+    peak_flops = get_gpu_peak_flops(gpu_model)
+    flops_per_forward = calculate_model_flops(raw_model, B, T)
+    flops_per_step = flops_per_forward * grad_accum_steps * 3  # 3x for forward + 2x backward
+    
+    print0(f"GPU: {gpu_model}")
+    print0(f"Peak FLOPS: {peak_flops/1e12:.1f} TFLOPS")
+    print0(f"Model FLOPS per forward pass: {flops_per_forward/1e12:.3f} TFLOPS")
+    print0(f"Model FLOPS per training step: {flops_per_step/1e12:.3f} TFLOPS")
+
+    # Handle checkpoint resuming
+    start_step = 0
+    if args.resume_from_checkpoint and os.path.exists(args.resume_from_checkpoint):
+        start_step = load_checkpoint(args.resume_from_checkpoint, raw_model, optimizer, train_loader)
+        print0(f"Resuming training from step {start_step}")
+
     # Learning rate scheduler
     def get_lr(it):
         min_lr = args.learning_rate * args.learning_rate_decay_frac
@@ -294,7 +319,8 @@ def train(args, model, train_loader, val_loader=None, logfile=None):
     norm = -1.0
 
     # Main training loop
-    for step in range(args.num_iterations + 1):
+    # for step in range(args.num_iterations + 1):
+    for step in range(start_step, args.num_iterations + 1):
         t0 = time.time()
         last_step = (step == args.num_iterations)
 
@@ -393,14 +419,18 @@ def train(args, model, train_loader, val_loader=None, logfile=None):
             torch.cuda.synchronize()
         
         t1 = time.time()
+        dt = t1 - t0
         tokens_per_second = grad_accum_steps * ddp_world_size * B * T / (t1-t0)
-        print0(f"step {step+1:4d}/{args.num_iterations} | train loss {lossf:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)")
-        
+        # Calculate FLOPS metrics
+        model_flops_per_sec = flops_per_step * ddp_world_size / dt
+        mfu = calculate_mfu(model_flops_per_sec, peak_flops * ddp_world_size)
+        print0(f"step {step+1:4d}/{args.num_iterations} | train loss {lossf:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s) | {mfu:.2f}% MFU")
+
         # Save checkpoint
         if (step > 0 and step % (args.checkpoint_every-1) == 0) or (step == args.num_iterations-1):
             if master_process:
                 print0(f"saving checkpoint at step {step+1} to {args.output_dir}")
-                save_checkpoint(step+1, args, raw_model, optimizer, lossf)
+                save_checkpoint(step+1, args, raw_model, optimizer, lossf, train_loader)
         
         # Log to file
         if master_process and logfile is not None:
@@ -454,7 +484,7 @@ def arg_parser():
     # debugging
     parser.add_argument("--overfit_single_batch", type=int, default=1, help="overfit just one batch of data")
     # numerics
-    parser.add_argument("--tensorcores", type=int, default=0, help="use tensorcores")
+    parser.add_argument("--tensorcores", type=int, default=1, help="use tensorcores")
     # memory management
     parser.add_argument("--device", type=str, default="", help="by default we autodetect, or set it here")
     parser.add_argument("--compile", type=int, default=0, help="torch.compile the model")
@@ -463,7 +493,7 @@ def arg_parser():
     # python -> C bridge
     parser.add_argument("--write_tensors", type=int, default=0, help="write tensors to disk")
     parser.add_argument("--checkpoint_every", type=int, default=500, help="save checkpoint every N steps")
-    
+    parser.add_argument("--resume_from_checkpoint", type=str, default="", help="path to checkpoint file to resume from")
     # HuggingFace export arguments
     parser.add_argument("--export_hf", type=int, default=1, help="export model to HuggingFace format after training")
     parser.add_argument("--export_hf_dir", type=str, default="./hf_model", help="directory to save HuggingFace model")
@@ -495,6 +525,7 @@ if __name__ == "__main__":
     assert 1 <= T <= 8192, "sequence length must be between 1 and 8192"
     assert args.dtype in {"float32", "float16", "bfloat16"}
     assert args.model in {"meta-llama/Meta-Llama-3.1-8B", "llama-pro-mini"} 
+    args.warmup_iters = int(0.1 * args.num_iterations) if args.warmup_iters == 0 else args.warmup_iters
 
     # Setup logging
     logfile = None

@@ -253,7 +253,7 @@ class LlamaConfig:
     use_scaled_rope: bool = True
     max_gen_batch_size: int = 4
     use_kv: bool = True
-    flash: bool = False  # use flashattention?
+    flash: bool = True  # use flashattention?
 
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
@@ -1018,6 +1018,32 @@ class DistributedShardedDataLoader:
             self.advance()
         return x, y
 
+    # NEW METHODS FOR CHECKPOINT SUPPORT
+    def get_state(self):
+        """Get the current state of the data loader for checkpointing"""
+        return {
+            'current_shard': self.current_shard,
+            'current_position': self.current_position,
+            'files': self.files,  # Save file list for consistency check
+        }
+    
+    def set_state(self, state):
+        """Restore the data loader state from a checkpoint"""
+        # Verify file consistency
+        if state['files'] != self.files:
+            print0("Warning: Data files have changed since checkpoint. This may affect training.")
+        
+        self.current_shard = state['current_shard']
+        
+        # Load the correct shard if needed
+        if self.current_shard != getattr(self, '_loaded_shard', None):
+            self.tokens = _load_data_shard(self.files[self.current_shard])
+            self._loaded_shard = self.current_shard
+        
+        self.current_position = state['current_position']
+        
+        print0(f"Restored data loader state: shard {self.current_shard}, position {self.current_position}")
+        
 # -----------------------------------------------------------------------------
 # Python -> C bridge utilities for saving params/grads/activations to .bin files
 
@@ -1121,15 +1147,184 @@ def print0(*args, **kwargs):
     if int(os.environ.get("RANK", 0)) == 0:
         print(*args, **kwargs)
         
-def save_checkpoint(step, args, raw_model, optimizer, lossf):
+def save_checkpoint(step, args, raw_model, optimizer, lossf, train_loader=None):
     """Helper function to save a checkpoint"""
     checkpoint = {
-        'model': raw_model.state_dict(),
-        'optimizer': optimizer.state_dict(),
+        'model_state_dict': raw_model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
         'step': step,
         'train_loss': lossf,
         'config': raw_model.config,
+        'args': vars(args),  # Save training arguments
+        'rng_state': torch.get_rng_state(),
     }
+    
+    # Save data loader state if provided
+    if train_loader is not None:
+        checkpoint['train_loader_state'] = train_loader.get_state()
+    
+    # Save CUDA RNG state if available
+    if torch.cuda.is_available():
+        checkpoint['cuda_rng_state'] = torch.cuda.get_rng_state()
+    
     checkpoint_path = os.path.join(args.output_dir, f"checkpoint_{step}.pt")
     torch.save(checkpoint, checkpoint_path)
+    
+    # Also save as latest checkpoint
+    latest_path = os.path.join(args.output_dir, "checkpoint_latest.pt")
+    torch.save(checkpoint, latest_path)
+    
     print0(f"Saved checkpoint to {checkpoint_path}")
+
+def load_checkpoint(checkpoint_path, model, optimizer, train_loader=None):
+    """
+    Load checkpoint and return the step number to resume from.
+    
+    Args:
+        checkpoint_path: path to checkpoint file
+        model: model to load state into
+        optimizer: optimizer to load state into
+        train_loader: data loader to restore state into (optional)
+        
+    Returns:
+        resume_step: step number to resume training from
+    """
+    print0(f"Loading checkpoint from {checkpoint_path}")
+    # checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    
+    # Load model state
+    model.load_state_dict(checkpoint['model_state_dict'])
+    
+    # Load optimizer state
+    if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    # Restore data loader state
+    if train_loader is not None and 'train_loader_state' in checkpoint:
+        train_loader.set_state(checkpoint['train_loader_state'])
+    
+    # Restore RNG states for reproducibility
+    if 'rng_state' in checkpoint:
+        torch.set_rng_state(checkpoint['rng_state'])
+    if 'cuda_rng_state' in checkpoint and torch.cuda.is_available():
+        torch.cuda.set_rng_state(checkpoint['cuda_rng_state'])
+    
+    # Get resume step
+    resume_step = checkpoint.get('step', 0)
+    
+    print0(f"Resumed from step {resume_step}")
+    return resume_step
+
+
+def calculate_model_flops(model, batch_size, sequence_length):
+    """
+    Calculate FLOPs for one forward pass of the LLaMA model.
+    
+    Args:
+        model: the LLaMA model
+        batch_size: batch size
+        sequence_length: sequence length
+        
+    Returns:
+        flops_per_forward: FLOPs for one forward pass
+    """
+    config = model.config
+    n_layer = config.n_layer
+    n_embd = config.n_embd
+    n_head = config.n_head
+    n_kv_head = getattr(config, 'n_kv_head', n_head)  # Default to n_head if not specified
+    vocab_size = config.vocab_size
+    
+    B, T = batch_size, sequence_length
+    
+    # Embedding layer: B * T * vocab_size * n_embd
+    embedding_flops = B * T * vocab_size * n_embd
+    
+    # Transformer layers
+    layer_flops = 0
+    
+    for _ in range(n_layer):
+        # Attention
+        # QKV projection: B * T * n_embd * (n_head + 2 * n_kv_head) * (n_embd // n_head)
+        qkv_flops = B * T * n_embd * (n_head + 2 * n_kv_head) * (n_embd // n_head)
+        
+        # Attention computation: B * n_head * T * T * (n_embd // n_head)
+        attn_flops = B * n_head * T * T * (n_embd // n_head)
+        
+        # Output projection: B * T * n_embd * n_embd
+        out_proj_flops = B * T * n_embd * n_embd
+        
+        # MLP (SwiGLU): 3 linear layers
+        # Gate & Up projections: 2 * (B * T * n_embd * 4 * n_embd)
+        # Down projection: B * T * 4 * n_embd * n_embd
+        mlp_flops = 2 * (B * T * n_embd * 4 * n_embd) + (B * T * 4 * n_embd * n_embd)
+        mlp_flops = B * T * n_embd * 4 * n_embd * 3  # Simplified
+        
+        layer_flops += qkv_flops + attn_flops + out_proj_flops + mlp_flops
+    
+    # Output layer: B * T * n_embd * vocab_size
+    output_flops = B * T * n_embd * vocab_size
+    
+    total_flops = embedding_flops + layer_flops + output_flops
+    
+    return total_flops
+
+def detect_gpu_model():
+    """Detect the GPU model for FLOPS calculation."""
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        
+        if "A100" in gpu_name:
+            return "A100"
+        elif "A5000" in gpu_name:
+            return "A5000"
+        elif "V100" in gpu_name:
+            return "V100"
+        elif "H100" in gpu_name:
+            return "H100"
+        elif "RTX 4090" in gpu_name or "4090" in gpu_name:
+            return "RTX4090"
+        elif "RTX 3090" in gpu_name or "3090" in gpu_name:
+            return "RTX3090"
+        else:
+            print0(f"Unknown GPU: {gpu_name}, using A100 specs as default")
+            return "A100"
+    
+    return "A100"  # Default fallback
+
+def get_gpu_peak_flops(device_name="A100"):
+    """
+    Get theoretical peak FLOPS for different GPU types.
+    
+    Args:
+        device_name: GPU model name
+        
+    Returns:
+        peak_flops: Peak FLOPS in operations per second
+    """
+    # Peak FLOPS for bfloat16 operations (using Tensor Cores)
+    gpu_specs = {
+        "A100": 312e12,    # 312 TFLOPS for bfloat16
+        "A5000": 54e12,   # 222 TFLOPS for fp16
+        "V100": 125e12,    # 125 TFLOPS for fp16  
+        "H100": 989e12,    # 989 TFLOPS for bfloat16
+        "RTX4090": 83e12,  # ~83 TFLOPS for bfloat16
+        "RTX3090": 35e12,  # ~35 TFLOPS for fp16
+    }
+    
+    return gpu_specs.get(device_name, 100e12)  # Default fallback
+
+def calculate_mfu(model_flops_per_sec, peak_flops_per_sec):
+    """
+    Calculate Model FLOPS Utilization (MFU).
+    
+    Args:
+        model_flops_per_sec: Actual FLOPS achieved by model
+        peak_flops_per_sec: Theoretical peak FLOPS of hardware
+        
+    Returns:
+        mfu: Model FLOPS Utilization as percentage
+    """
+    return (model_flops_per_sec / peak_flops_per_sec) * 100
+
