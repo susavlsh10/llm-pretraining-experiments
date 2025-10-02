@@ -29,7 +29,8 @@ from models.llama import (print0, LLaMA, LlamaConfig,
                          test_exported_model, save_checkpoint, load_checkpoint)
 
 from models.llama import (detect_gpu_model, calculate_model_flops,
-                          get_gpu_peak_flops, calculate_mfu)
+                          get_gpu_peak_flops, calculate_mfu, 
+                          calculate_model_parameters, print_model_info)
 
 from typing import List
 
@@ -181,6 +182,7 @@ def initialize_model(args):
         model = LLaMA.from_pretrained_llama3_meta(args.ckpt_dir, args.tokenizer_path)
 
     print(f"Model initialized.")
+    print_model_info(model)
     return model
 
 def setup_dataloaders(args, ddp_rank, ddp_world_size):
@@ -503,12 +505,12 @@ def arg_parser():
     parser.add_argument("--test_exported_model", type=int, default=1, help="test exported model with sample generation")
     
     # Custom model configuration arguments
-    parser.add_argument("--custom_n_layer", type=int, default=12, help="override number of layers")
+    parser.add_argument("--custom_n_layer", type=int, default=16, help="override number of layers")
     parser.add_argument("--custom_n_embd", type=int, default=1024, help="override embedding dimension")
-    parser.add_argument("--custom_n_head", type=int, default=None, help="override number of attention heads")
-    parser.add_argument("--custom_n_kv_head", type=int, default=None, help="override number of key-value heads")
+    parser.add_argument("--custom_n_head", type=int, default=16, help="override number of attention heads")
+    parser.add_argument("--custom_n_kv_head", type=int, default=16, help="override number of key-value heads")
     parser.add_argument("--custom_vocab_size", type=int, default=None, help="override vocabulary size")
-    parser.add_argument("--custom_block_size", type=int, default=None, help="override maximum sequence length")
+    parser.add_argument("--custom_block_size", type=int, default=1024, help="override maximum sequence length")
     
     args = parser.parse_args()
     return args

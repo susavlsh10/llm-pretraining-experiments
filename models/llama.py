@@ -26,9 +26,17 @@ from torch.nn import functional as F
 
 from torch.distributed.optim import ZeroRedundancyOptimizer
 
+# import tiktoken
+# from tiktoken.load import load_tiktoken_bpe
 
-import tiktoken
-from tiktoken.load import load_tiktoken_bpe
+# Tiktoken imports with conditional handling
+try:
+    import tiktoken
+    from tiktoken.load import load_tiktoken_bpe
+    TIKTOKEN_AVAILABLE = True
+except ImportError:
+    print("Warning: tiktoken library not available. Tokenizer functionality will be disabled.")
+    TIKTOKEN_AVAILABLE = False
 
 # HuggingFace imports for export functionality
 try:
@@ -607,6 +615,9 @@ class Tokenizer:
         Args:
             model_path (str): The path to the Tiktoken model file.
         """
+        if not TIKTOKEN_AVAILABLE:
+            raise ImportError("tiktoken library is required for Tokenizer. Install with: pip install tiktoken")
+        
         assert os.path.isfile(model_path), model_path
 
         mergeable_ranks = load_tiktoken_bpe(model_path)
@@ -788,7 +799,7 @@ def export_to_huggingface(model, tokenizer, output_dir, model_name=None, push_to
         max_position_embeddings=config.block_size,
         rms_norm_eps=config.norm_eps,
         rope_theta=config.rope_theta,
-        rope_scaling={"type": "default", "factor": 1.0} if not config.use_scaled_rope else {"type": "linear", "factor": 8.0},
+        rope_scaling=None,
         tie_word_embeddings=False,
         torch_dtype="bfloat16"
     )
@@ -808,17 +819,30 @@ def export_to_huggingface(model, tokenizer, output_dir, model_name=None, push_to
     hf_config.save_pretrained(output_dir)
     
     # Handle tokenizer
-    if hasattr(tokenizer, 'save_pretrained'):
-        # HuggingFace tokenizer
-        tokenizer.save_pretrained(output_dir)
-    else:
-        # Our custom tokenizer - use a base LLaMA tokenizer as fallback
-        try:
-            base_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
-            base_tokenizer.save_pretrained(output_dir)
-            print0("Warning: Using base LLaMA tokenizer as fallback")
-        except:
-            print0("Warning: Could not save tokenizer. You may need to manually add a tokenizer.")
+    # if hasattr(tokenizer, 'save_pretrained'):
+    #     # HuggingFace tokenizer
+    #     tokenizer.save_pretrained(output_dir)
+    # else:
+    #     # Our custom tokenizer - use a base LLaMA tokenizer as fallback
+    #     try:
+    #         # base_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf")
+    #         base_tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3.1-8B")
+    #         base_tokenizer.save_pretrained(output_dir)
+    #         print0("Warning: Using base LLaMA 3.1 tokenizer as fallback")
+    #     except:
+    #         print0("Warning: Could not save tokenizer. You may need to manually add a tokenizer.")
+    
+    # Always use Meta-Llama-3.1-8B tokenizer
+    try:
+        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3.1-8B")
+        print0("Using Meta-Llama-3.1-8B tokenizer")
+    except Exception as e:
+        print0(f"Error loading Meta-Llama-3.1-8B tokenizer: {e}")
+        raise Exception("Could not load LLaMA-3.1-8B tokenizer")
+    
+    # Save the tokenizer (now guaranteed to be not None)
+    tokenizer.save_pretrained(output_dir)
+    print0("Tokenizer saved successfully")
     
     # Push to HuggingFace Hub if requested
     if push_to_hub and model_name:
@@ -1328,3 +1352,45 @@ def calculate_mfu(model_flops_per_sec, peak_flops_per_sec):
     """
     return (model_flops_per_sec / peak_flops_per_sec) * 100
 
+def calculate_model_parameters(model):
+    """
+    Calculate the total number of parameters and trainable parameters in the model.
+    
+    Args:
+        model: PyTorch model
+        
+    Returns:
+        tuple: (total_params, trainable_params)
+    """
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    return total_params, trainable_params
+
+def print_model_info(model):
+    """
+    Print detailed information about the model including parameter counts.
+    
+    Args:
+        model: PyTorch model
+    """
+    total_params, trainable_params = calculate_model_parameters(model)
+    
+    print0(f"Model parameter summary:")
+    print0(f"  Total parameters: {total_params:,}")
+    print0(f"  Trainable parameters: {trainable_params:,}")
+    print0(f"  Non-trainable parameters: {total_params - trainable_params:,}")
+    print0(f"  Model size (float32): {total_params * 4 / 1024**2:.2f} MB")
+    print0(f"  Model size (bfloat16): {total_params * 2 / 1024**2:.2f} MB")
+    
+    # print in Millions of parameters
+    print0(f"  Model size: {total_params / 1e6:.2f} Million parameters")
+
+    
+    # Print parameter breakdown by module type
+    # print0(f"\nParameter breakdown by module:")
+    # for name, module in model.named_modules():
+    #     if len(list(module.children())) == 0:  # leaf modules only
+    #         module_params = sum(p.numel() for p in module.parameters())
+    #         if module_params > 0:
+    #             print0(f"  {name}: {module_params:,} parameters")
