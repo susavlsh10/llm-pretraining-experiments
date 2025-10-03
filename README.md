@@ -36,6 +36,6 @@ python train_llama3.py --model llama-pro-mini --input_bin "/pscratch/sd/s/susav/
 Multi GPU
 
 ```bash
-torchrun --nproc_per_node=4 train_llama3.py --model llama-pro-mini --input_bin "/pscratch/sd/s/susav/fineweb10B/fineweb_train_*.bin" --input_val_bin "/pscratch/sd/s/susav/fineweb10B/fineweb_val_*.bin" --batch_size 8 --sequence_length 1024 --total_batch_size 8192 --num_iterations 20 --output_dir /pscratch/sd/s/susav/llm_training --resume_from_checkpoint /pscratch/sd/s/susav/llm_training/checkpoint_20.pt
+torchrun --nproc_per_node=4 train_llama3.py --model llama-pro-mini --input_bin "/pscratch/sd/s/susav/fineweb10B/fineweb_train_*.bin" --input_val_bin "/pscratch/sd/s/susav/fineweb10B/fineweb_val_*.bin" --batch_size 16 --sequence_length 1024 --total_batch_size 524288 --num_iterations 20 --output_dir /pscratch/sd/s/susav/llm_training --export_hf 0 --run_id 0 --resume_from_checkpoint /pscratch/sd/s/susav/llm_training/checkpoint_latest
 
 ```

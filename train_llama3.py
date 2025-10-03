@@ -23,14 +23,16 @@ torchrun --nproc_per_node=2 train_llama3.py --input_bin /path/to/fineweb_train_*
 
 import argparse
 import torch
-from models.llama import (print0, LLaMA, LlamaConfig,
+from models.llama import (LLaMA, LlamaConfig,
                          DistributedShardedDataLoader, write_model, write_state,
                          export_to_huggingface,
                          test_exported_model, save_checkpoint, load_checkpoint)
 
 from models.llama import (detect_gpu_model, calculate_model_flops,
-                          get_gpu_peak_flops, calculate_mfu, 
+                          get_gpu_peak_flops, calculate_mfu_from_throughput, 
                           calculate_model_parameters, print_model_info)
+
+from utils.llama_utils import setup_logging, print0
 
 from typing import List
 
@@ -38,12 +40,17 @@ import os
 import time
 import math
 import numpy as np
+import logging
+import sys
+from datetime import datetime
 from contextlib import nullcontext
 
 from torch.distributed import init_process_group, destroy_process_group
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch._inductor.config as config
+
+
 
 def save_to_huggingface(args, raw_model, master_process):
     if args.export_hf and master_process:
@@ -127,6 +134,12 @@ def setup_ddp_and_device(args):
     assert device_type in {'cuda'}, "GPU required to run LLaMA 3"
     print(f"using device: {device}")
     
+    # update output_dir to include run_id
+    if args.output_dir:
+        args.output_dir = os.path.join(args.output_dir, f"run_{args.run_id}")
+        if master_process:
+            os.makedirs(args.output_dir, exist_ok=True)
+    
     return ddp, ddp_rank, ddp_local_rank, ddp_world_size, master_process, device, device_type, zero_stage
 
 def initialize_model(args):
@@ -169,7 +182,7 @@ def initialize_model(args):
             # Create new model with custom config
             print0("Creating model with custom configuration...")
             model = LLaMA(custom_config)
-            print(model)
+            print0(model)
             
             # Initialize weights properly
             model.apply(lambda m: m.reset_parameters() if hasattr(m, 'reset_parameters') else None)
@@ -202,8 +215,9 @@ def setup_dataloaders(args, ddp_rank, ddp_world_size):
     train_loader = DistributedShardedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
     val_loader = None
     if args.input_val_bin:
-        val_loader = DistributedShardedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
-    
+        val_batch_size = 4 #min(B, B // 2)  # Use half the training batch size
+        val_loader = DistributedShardedDataLoader(args.input_val_bin, val_batch_size, T, ddp_rank, ddp_world_size)
+        print0(f"Validation loader initialized with batch size {val_batch_size}.")
     return train_loader, val_loader
 
 def write_debug_tensors(args, model, train_loader, device, master_process):
@@ -330,6 +344,10 @@ def train(args, model, train_loader, val_loader=None, logfile=None):
         if (args.val_loss_every > 0 and 
             (step % args.val_loss_every == 0 or last_step) and 
             val_loader is not None):
+            
+            # clear memory 
+            # torch.cuda.empty_cache()
+            
             model.eval()
             val_loader.reset()
             with torch.no_grad():
@@ -345,6 +363,9 @@ def train(args, model, train_loader, val_loader=None, logfile=None):
             if master_process and logfile is not None:
                 with open(logfile, "a") as f:
                     f.write("s:%d tel:%f\n" % (step, val_loss))
+            
+            # clear memory 
+            # torch.cuda.empty_cache()
 
         # Model sampling/inference
         if (args.sample_every > 0 and 
@@ -422,11 +443,30 @@ def train(args, model, train_loader, val_loader=None, logfile=None):
         
         t1 = time.time()
         dt = t1 - t0
-        tokens_per_second = grad_accum_steps * ddp_world_size * B * T / (t1-t0)
+        total_tokens_per_second = grad_accum_steps * ddp_world_size * B * T / (t1-t0)
+        if ddp:
+            tokens_per_second_gpu = total_tokens_per_second // ddp_world_size
+        else:
+            tokens_per_second_gpu = total_tokens_per_second
         # Calculate FLOPS metrics
-        model_flops_per_sec = flops_per_step * ddp_world_size / dt
-        mfu = calculate_mfu(model_flops_per_sec, peak_flops * ddp_world_size)
-        print0(f"step {step+1:4d}/{args.num_iterations} | train loss {lossf:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s) | {mfu:.2f}% MFU")
+        # model_flops_per_sec = flops_per_step * ddp_world_size / dt
+        # mfu = calculate_mfu(model_flops_per_sec, peak_flops * ddp_world_size)
+
+        mfu = calculate_mfu_from_throughput(model, tokens_per_second_gpu)
+        # if ddp:
+        
+        # print0(f"step {step+1:4d}/{args.num_iterations} | train loss {lossf:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(t1-t0)*1000:.2f} ms | {total_tokens_per_second:.0f} tok/s) | {mfu:.2f}% MFU")
+        
+        # Also log structured metrics for easier parsing
+        if master_process:
+            training_logger.log_metrics(step+1, {
+                'train_loss': f"{lossf:.6f}",
+                'grad_norm': f"{norm:.4f}",
+                'learning_rate': f"{lr:.2e}",
+                'step_time_ms': f"{(t1-t0)*1000:.2f}",
+                'tokens_per_sec': f"{total_tokens_per_second:.0f}",
+                'mfu_percent': f"{mfu:.2f}"
+            })
 
         # Save checkpoint
         if (step > 0 and step % (args.checkpoint_every-1) == 0) or (step == args.num_iterations-1):
@@ -468,19 +508,19 @@ def arg_parser():
     parser.add_argument("--model", type=str, default="llama-pro-mini", help="chose the llama model, meta-llama/Meta-Llama-3.1-8B, llama-pro-mini")
     # token layout for each step of the optimization
     parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
-    parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
-    parser.add_argument("--total_batch_size", type=int, default=256, help="total desired batch size, in units of #tokens")
+    parser.add_argument("--sequence_length", type=int, default=1024, help="sequence length")
+    parser.add_argument("--total_batch_size", type=int, default=524288, help="total desired batch size, in units of #tokens")
     # workload (number of steps)
     parser.add_argument("--num_iterations", type=int, default=10, help="number of iterations to run")
     parser.add_argument("--inference_only", type=int, default=0, help="only run inference")
     # optimization
-    parser.add_argument("--learning_rate", type=float, default=1e-5, help="learning rate warmup iterations")
+    parser.add_argument("--learning_rate", type=float, default=6e-4, help="learning rate warmup iterations")
     parser.add_argument("--warmup_iters", type=int, default=0, help="learning rate warmup iterations")
     parser.add_argument("--learning_rate_decay_frac", type=float, default=1.0, help="learning rate warmup iterations")
-    parser.add_argument("--weight_decay", type=float, default=0.0, help="weight decay")
+    parser.add_argument("--weight_decay", type=float, default=0.1, help="weight decay")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="maximum gradient magnitude")
     # evaluation
-    parser.add_argument("--val_loss_every", type=int, default=0, help="every how mant steps to evaluate val loss?")
+    parser.add_argument("--val_loss_every", type=int, default=10, help="every how mant steps to evaluate val loss?")
     parser.add_argument("--val_max_steps", type=int, default=20, help="how many batches of val to average?")
     parser.add_argument("--sample_every", type=int, default=0, help="how often to sample from the model?")
     # debugging
@@ -505,13 +545,19 @@ def arg_parser():
     parser.add_argument("--test_exported_model", type=int, default=1, help="test exported model with sample generation")
     
     # Custom model configuration arguments
-    parser.add_argument("--custom_n_layer", type=int, default=16, help="override number of layers")
-    parser.add_argument("--custom_n_embd", type=int, default=1024, help="override embedding dimension")
-    parser.add_argument("--custom_n_head", type=int, default=16, help="override number of attention heads")
-    parser.add_argument("--custom_n_kv_head", type=int, default=16, help="override number of key-value heads")
+    parser.add_argument("--custom_n_layer", type=int, default=14, help="override number of layers")
+    parser.add_argument("--custom_n_embd", type=int, default=768, help="override embedding dimension")
+    parser.add_argument("--custom_n_head", type=int, default=12, help="override number of attention heads")
+    parser.add_argument("--custom_n_kv_head", type=int, default=12, help="override number of key-value heads")
     parser.add_argument("--custom_vocab_size", type=int, default=None, help="override vocabulary size")
     parser.add_argument("--custom_block_size", type=int, default=1024, help="override maximum sequence length")
     
+    # Logging arguments
+    parser.add_argument("--log_level", type=str, default="INFO", help="logging level (DEBUG, INFO, WARNING, ERROR)")
+    parser.add_argument("--log_to_console", type=int, default=1, help="whether to also print logs to console")
+    
+    # training run id 
+    parser.add_argument("--run_id", type=str, default="1", help="an optional id for this training run, for logging")
     args = parser.parse_args()
     return args
 
@@ -519,8 +565,18 @@ def arg_parser():
 if __name__ == "__main__":
     # Parse arguments and basic setup
     args = arg_parser()
+    
+    # Setup DDP and device first to get master_process
+    ddp, ddp_rank, ddp_local_rank, ddp_world_size, master_process, device, device_type, zero_stage = setup_ddp_and_device(args)
+    
+    # Setup comprehensive logging
+    training_logger, log_file_path = setup_logging(args, master_process, ddp_rank)
+    
     print0(f"Running pytorch {torch.version.__version__}")
     print0(f"args: {args}")
+    
+    if master_process and log_file_path:
+        print0(f"All output will be logged to: {log_file_path}")
     
     # Args validation
     B, T = args.batch_size, args.sequence_length
@@ -529,16 +585,13 @@ if __name__ == "__main__":
     assert args.model in {"meta-llama/Meta-Llama-3.1-8B", "llama-pro-mini"} 
     args.warmup_iters = int(0.1 * args.num_iterations) if args.warmup_iters == 0 else args.warmup_iters
 
-    # Setup logging
+    # Setup logging for backward compatibility (loss metrics)
     logfile = None
     if args.output_dir:
         os.makedirs(args.output_dir, exist_ok=True)
         logfile = os.path.join(args.output_dir, "main.log")
-        with open(logfile, "w") as f:
+        with open(logfile, "a") as f:
             pass
-
-    # Setup DDP and device
-    ddp, ddp_rank, ddp_local_rank, ddp_world_size, master_process, device, device_type, zero_stage = setup_ddp_and_device(args)
 
     # Calculate gradient accumulation
     tokens_per_fwdbwd = B * T * ddp_world_size
@@ -557,6 +610,7 @@ if __name__ == "__main__":
         torch.set_float32_matmul_precision('high')
 
     # Initialize model
+    print0("Initializing model...")
     model = initialize_model(args)
     model = model.to(device)
     model.train()
@@ -568,6 +622,7 @@ if __name__ == "__main__":
         model = torch.compile(model)
 
     # Setup data loaders
+    print0("Setting up data loaders...")
     train_loader, val_loader = setup_dataloaders(args, ddp_rank, ddp_world_size)
 
     # Write tensors for C bridge if requested
@@ -575,13 +630,17 @@ if __name__ == "__main__":
 
     # Wrap model in DDP if needed
     if ddp:
+        print0("Wrapping model in DDP...")
         model = DDP(model, device_ids=[ddp_local_rank])
 
     # Run training
+    print0("Starting training...")
     trained_model = train(args, model, train_loader, val_loader, logfile)
 
     # Export to HuggingFace format if requested
     save_to_huggingface(args, trained_model, master_process)
+
+    print0("Training completed!")
 
     # Cleanup
     if ddp:

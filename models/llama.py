@@ -154,7 +154,7 @@ class CausalSelfAttention(nn.Module):
         self.n_rep = self.n_head // self.n_kv_head
         self.hd = config.n_embd // config.n_head
         self.use_kv = config.use_kv
-        self.flash = config.flash
+        self.flash = True # config.flash
 
         self.c_attn = nn.Linear(config.n_embd, (config.n_head + 2 * config.n_kv_head) * self.hd, bias=False)  # key, query, value projections
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)  # output projection
@@ -260,7 +260,7 @@ class LlamaConfig:
     rope_theta: float = 500000.0
     use_scaled_rope: bool = True
     max_gen_batch_size: int = 4
-    use_kv: bool = True
+    use_kv: bool = False
     flash: bool = True  # use flashattention?
 
     def __init__(self, **kwargs):
@@ -283,6 +283,7 @@ class LLaMA(nn.Module):
             ln_f = RMSNorm(config.n_embd, config.norm_eps),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        # self.lm_head.weight = self.transformer.wte.weight
 
         # init all weights, use a torch rng object to be very careful
         self.init_rng = torch.Generator()
@@ -1166,13 +1167,29 @@ def write_state(model, x, y, logits, loss, filename):
 # int main
 
 def print0(*args, **kwargs):
-    # modified print that only prints from the master process
-    # if this is not a distributed run, it's just a print
+    """
+    Print function that only prints from the master process.
+    This is overridden by the TrainingLogger during training.
+    """
+    # Default behavior - just check environment for rank
     if int(os.environ.get("RANK", 0)) == 0:
         print(*args, **kwargs)
         
 def save_checkpoint(step, args, raw_model, optimizer, lossf, train_loader=None):
     """Helper function to save a checkpoint"""
+    
+    # Handle ZeroRedundancyOptimizer state consolidation
+    # optimizer_state_dict = None
+    # if optimizer is not None:
+    #     if hasattr(optimizer, 'consolidate_state_dict'):
+    #         # For ZeroRedundancyOptimizer, consolidate state on rank 0
+    #         optimizer.consolidate_state_dict(to=0)
+    #         if print0.rank == 0:
+    #             optimizer_state_dict = optimizer.state_dict()
+    #     else:
+    #         # For regular optimizers
+    #         optimizer_state_dict = optimizer.state_dict()
+    
     checkpoint = {
         'model_state_dict': raw_model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
@@ -1339,9 +1356,58 @@ def get_gpu_peak_flops(device_name="A100"):
     
     return gpu_specs.get(device_name, 100e12)  # Default fallback
 
+def calculate_model_flops_per_token(model):
+    """
+    Calculate FLOPs per token using the approximation: 6 * number of parameters.
+    
+    This is a common approximation where:
+    - 2 * params for forward pass
+    - 4 * params for backward pass (3x forward + 1x for gradient computation)
+    Total = 6 * params per token
+    
+    Args:
+        model: the LLaMA model
+        
+    Returns:
+        flops_per_token: FLOPs required to process one token
+    """
+    total_params = sum(p.numel() for p in model.parameters())
+    return 6 * total_params
+
+def calculate_mfu_from_throughput(model, tokens_per_second, device_name=None):
+    """
+    Calculate Model FLOPS Utilization (MFU) using observed throughput.
+    
+    Formula: MFU = (model_flops_per_token * observed_tokens_per_second) / theoretical_peak_hardware_flops
+    
+    Args:
+        model: PyTorch model
+        tokens_per_second: Observed tokens processed per second
+        device_name: GPU model name (auto-detected if None)
+        
+    Returns:
+        mfu: Model FLOPS Utilization as percentage
+    """
+    if device_name is None:
+        device_name = detect_gpu_model()
+    
+    # Calculate model FLOPs per token using 6 * num_params approximation
+    model_flops_per_token = calculate_model_flops_per_token(model)
+    
+    # Calculate actual FLOPs per second achieved
+    model_flops_per_sec = model_flops_per_token * tokens_per_second
+    
+    # Get theoretical peak hardware FLOPs
+    peak_flops_per_sec = get_gpu_peak_flops(device_name)
+    
+    # Calculate MFU as percentage
+    mfu = (model_flops_per_sec / peak_flops_per_sec) * 100
+    
+    return mfu
+
 def calculate_mfu(model_flops_per_sec, peak_flops_per_sec):
     """
-    Calculate Model FLOPS Utilization (MFU).
+    Calculate Model FLOPS Utilization (MFU) - legacy method.
     
     Args:
         model_flops_per_sec: Actual FLOPS achieved by model
@@ -1362,19 +1428,31 @@ def calculate_model_parameters(model):
     Returns:
         tuple: (total_params, trainable_params)
     """
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    # total_params = sum(p.numel() for p in model.parameters())
+    # trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    # Use named_parameters to avoid double counting tied weights
+    unique_params = {}
+    for name, param in model.named_parameters():
+        # Use the parameter's data_ptr as a unique identifier
+        param_id = param.data_ptr()
+        if param_id not in unique_params:
+            unique_params[param_id] = param
+    
+    total_params = sum(p.numel() for p in unique_params.values())
+    trainable_params = sum(p.numel() for p in unique_params.values() if p.requires_grad)
     
     return total_params, trainable_params
 
 def print_model_info(model):
     """
-    Print detailed information about the model including parameter counts.
+    Print detailed information about the model including parameter counts and FLOPS info.
     
     Args:
         model: PyTorch model
     """
     total_params, trainable_params = calculate_model_parameters(model)
+    model_flops_per_token = calculate_model_flops_per_token(model)
     
     print0(f"Model parameter summary:")
     print0(f"  Total parameters: {total_params:,}")
@@ -1382,9 +1460,8 @@ def print_model_info(model):
     print0(f"  Non-trainable parameters: {total_params - trainable_params:,}")
     print0(f"  Model size (float32): {total_params * 4 / 1024**2:.2f} MB")
     print0(f"  Model size (bfloat16): {total_params * 2 / 1024**2:.2f} MB")
-    
-    # print in Millions of parameters
     print0(f"  Model size: {total_params / 1e6:.2f} Million parameters")
+    print0(f"  Model FLOPs per token: {model_flops_per_token:,} ({model_flops_per_token / 1e9:.2f} GFLOPs)")
 
     
     # Print parameter breakdown by module type
