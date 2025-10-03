@@ -515,12 +515,12 @@ def arg_parser():
     parser.add_argument("--inference_only", type=int, default=0, help="only run inference")
     # optimization
     parser.add_argument("--learning_rate", type=float, default=6e-4, help="learning rate warmup iterations")
-    parser.add_argument("--warmup_iters", type=int, default=0, help="learning rate warmup iterations")
-    parser.add_argument("--learning_rate_decay_frac", type=float, default=1.0, help="learning rate warmup iterations")
+    parser.add_argument("--warmup_iters", type=int, default=700, help="learning rate warmup iterations")
+    parser.add_argument("--learning_rate_decay_frac", type=float, default=0.1, help="learning rate warmup iterations")
     parser.add_argument("--weight_decay", type=float, default=0.1, help="weight decay")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="maximum gradient magnitude")
     # evaluation
-    parser.add_argument("--val_loss_every", type=int, default=10, help="every how mant steps to evaluate val loss?")
+    parser.add_argument("--val_loss_every", type=int, default=250, help="every how mant steps to evaluate val loss?")
     parser.add_argument("--val_max_steps", type=int, default=20, help="how many batches of val to average?")
     parser.add_argument("--sample_every", type=int, default=0, help="how often to sample from the model?")
     # debugging
