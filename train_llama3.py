@@ -524,7 +524,7 @@ def arg_parser():
     parser.add_argument("--val_max_steps", type=int, default=20, help="how many batches of val to average?")
     parser.add_argument("--sample_every", type=int, default=0, help="how often to sample from the model?")
     # debugging
-    parser.add_argument("--overfit_single_batch", type=int, default=1, help="overfit just one batch of data")
+    parser.add_argument("--overfit_single_batch", type=int, default=0, help="overfit just one batch of data")
     # numerics
     parser.add_argument("--tensorcores", type=int, default=1, help="use tensorcores")
     # memory management
