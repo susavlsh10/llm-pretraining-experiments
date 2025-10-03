@@ -1,1 +1,6 @@
 ckpt
+__pycache__
+hf_model
+archive
+*.bin
+gpt-pro

@@ -233,7 +233,7 @@ class GPT(
         return model
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type, zero_stage):
-        from utils import print0  # Import here to avoid circular imports
+        from utils.gpt_utils import print0  # Import here to avoid circular imports
         
         # start with all of the candidate parameters
         param_dict = {pn: p for pn, p in self.named_parameters()}
